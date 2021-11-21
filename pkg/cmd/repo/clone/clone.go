@@ -6,13 +6,12 @@ import (
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/git"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghinstance"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -44,7 +43,7 @@ func NewCmdClone(f *cmdutil.Factory, runF func(*CloneOptions) error) *cobra.Comm
 
 			If the "OWNER/" portion of the "OWNER/REPO" repository argument is omitted, it
 			defaults to the name of the authenticating user.
-			
+
 			Pass additional 'git clone' flags by listing them after '--'.
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -82,12 +81,13 @@ func cloneRun(opts *CloneOptions) error {
 
 	apiClient := api.NewClientFromHTTP(httpClient)
 
-	respositoryIsURL := strings.Contains(opts.Repository, ":")
-	repositoryIsFullName := !respositoryIsURL && strings.Contains(opts.Repository, "/")
+	repositoryIsURL := strings.Contains(opts.Repository, ":")
+	repositoryIsFullName := !repositoryIsURL && strings.Contains(opts.Repository, "/")
 
 	var repo ghrepo.Interface
 	var protocol string
-	if respositoryIsURL {
+
+	if repositoryIsURL {
 		repoURL, err := git.ParseURL(opts.Repository)
 		if err != nil {
 			return err
@@ -105,7 +105,11 @@ func cloneRun(opts *CloneOptions) error {
 		if repositoryIsFullName {
 			fullName = opts.Repository
 		} else {
-			currentUser, err := api.CurrentLoginName(apiClient, ghinstance.OverridableDefault())
+			host, err := cfg.DefaultHost()
+			if err != nil {
+				return err
+			}
+			currentUser, err := api.CurrentLoginName(apiClient, host)
 			if err != nil {
 				return err
 			}
@@ -123,6 +127,12 @@ func cloneRun(opts *CloneOptions) error {
 		}
 	}
 
+	wantsWiki := strings.HasSuffix(repo.RepoName(), ".wiki")
+	if wantsWiki {
+		repoName := strings.TrimSuffix(repo.RepoName(), ".wiki")
+		repo = ghrepo.NewWithHost(repo.RepoOwner(), repoName, repo.RepoHost())
+	}
+
 	// Load the repo from the API to get the username/repo name in its
 	// canonical capitalization
 	canonicalRepo, err := api.GitHubRepo(apiClient, repo)
@@ -130,6 +140,14 @@ func cloneRun(opts *CloneOptions) error {
 		return err
 	}
 	canonicalCloneURL := ghrepo.FormatRemoteURL(canonicalRepo, protocol)
+
+	// If repo HasWikiEnabled and wantsWiki is true then create a new clone URL
+	if wantsWiki {
+		if !canonicalRepo.HasWikiEnabled {
+			return fmt.Errorf("The '%s' repository does not have a wiki", ghrepo.FullName(canonicalRepo))
+		}
+		canonicalCloneURL = strings.TrimSuffix(canonicalCloneURL, ".git") + ".wiki.git"
+	}
 
 	cloneDir, err := git.RunClone(canonicalCloneURL, opts.GitArgs)
 	if err != nil {
@@ -144,7 +162,7 @@ func cloneRun(opts *CloneOptions) error {
 		}
 		upstreamURL := ghrepo.FormatRemoteURL(canonicalRepo.Parent, protocol)
 
-		err = git.AddUpstreamRemote(upstreamURL, cloneDir)
+		err = git.AddUpstreamRemote(upstreamURL, cloneDir, []string{canonicalRepo.Parent.DefaultBranchRef.Name})
 		if err != nil {
 			return err
 		}

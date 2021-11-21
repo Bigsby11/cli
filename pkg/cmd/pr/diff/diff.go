@@ -9,41 +9,45 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/context"
-	"github.com/cli/cli/internal/ghrepo"
-	"github.com/cli/cli/pkg/cmd/pr/shared"
-	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
+	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
 )
 
 type DiffOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
-	Remotes    func() (context.Remotes, error)
-	Branch     func() (string, error)
+
+	Finder shared.PRFinder
 
 	SelectorArg string
 	UseColor    string
+	Patch       bool
 }
 
 func NewCmdDiff(f *cmdutil.Factory, runF func(*DiffOptions) error) *cobra.Command {
 	opts := &DiffOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
-		Remotes:    f.Remotes,
-		Branch:     f.Branch,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "diff [<number> | <url> | <branch>]",
 		Short: "View changes in a pull request",
-		Args:  cobra.MaximumNArgs(1),
+		Long: heredoc.Doc(`
+			View changes in a pull request. 
+
+			Without an argument, the pull request that belongs to the current branch
+			is selected.			
+		`),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
+			opts.Finder = shared.NewFinder(f)
 
 			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
 				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
@@ -69,23 +73,27 @@ func NewCmdDiff(f *cmdutil.Factory, runF func(*DiffOptions) error) *cobra.Comman
 	}
 
 	cmd.Flags().StringVar(&opts.UseColor, "color", "auto", "Use color in diff output: {always|never|auto}")
+	cmd.Flags().BoolVar(&opts.Patch, "patch", false, "Display diff in patch format")
 
 	return cmd
 }
 
 func diffRun(opts *DiffOptions) error {
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"number"},
+	}
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
+	if err != nil {
+		return err
+	}
+
 	httpClient, err := opts.HttpClient()
 	if err != nil {
 		return err
 	}
-	apiClient := api.NewClientFromHTTP(httpClient)
 
-	pr, baseRepo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
-	if err != nil {
-		return err
-	}
-
-	diff, err := apiClient.PullRequestDiff(baseRepo, pr.Number)
+	diff, err := fetchDiff(httpClient, baseRepo, pr.Number, opts.Patch)
 	if err != nil {
 		return fmt.Errorf("could not find pull request diff: %w", err)
 	}
@@ -125,6 +133,36 @@ func diffRun(opts *DiffOptions) error {
 	}
 
 	return nil
+}
+
+func fetchDiff(httpClient *http.Client, baseRepo ghrepo.Interface, prNumber int, asPatch bool) (io.ReadCloser, error) {
+	url := fmt.Sprintf(
+		"%srepos/%s/pulls/%d",
+		ghinstance.RESTPrefix(baseRepo.RepoHost()),
+		ghrepo.FullName(baseRepo),
+		prNumber,
+	)
+	acceptType := "application/vnd.github.v3.diff"
+	if asPatch {
+		acceptType = "application/vnd.github.v3.patch"
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", acceptType)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, api.HandleHTTPError(resp)
+	}
+
+	return resp.Body, nil
 }
 
 var diffHeaderPrefixes = []string{"+++", "---", "diff", "index"}
